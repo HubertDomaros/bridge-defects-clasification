@@ -6,11 +6,14 @@ import torch.optim as optim
 import logging
 from datetime import datetime
 from torchvision import models, transforms
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
-from torch.utils.data.dataloader import default_collate
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchinfo import summary
+from PIL import Image
+
+import shutil
+
 # from lightning_sdk import Studio
 
 # Set up logging
@@ -52,38 +55,95 @@ def get_device():
     verbose_logger.debug(f"Using device: {device}")
     return device
 
-def get_data_loaders(train_dir, val_dir, test_dir, batch_size=16):
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
 
-    verbose_logger.info('Transforming train dataset')
-    train_dataset = ImageFolder(train_dir, transform=transform)
-    verbose_logger.info('Transforming val dataset')
-    val_dataset = ImageFolder(val_dir, transform=transform)
-    verbose_logger.info('Transforming test dataset')
-    test_dataset = ImageFolder(test_dir, transform=transform)
+def transform_and_save_dataset(input_dir, output_dir, transform, expected_classes=5):
+    # Check if tensors already exist
+    if os.path.exists(output_dir):
+        if len(os.listdir(output_dir)) == expected_classes:
+            verbose_logger.info(f"Tensors already exist in {output_dir}, skipping transformation")
+            return
+        else:
+            verbose_logger.warning(f"Found incomplete tensor directory, recreating tensors")
+            shutil.rmtree(output_dir)
 
-    verbose_logger.debug(f'Train dataset size: {len(train_dataset)}')
-    verbose_logger.debug(f'Val dataset size: {len(val_dataset)}')
-    verbose_logger.debug(f'Test dataset size: {len(test_dataset)}')
+    os.makedirs(output_dir, exist_ok=True)
+    dataset = ImageFolder(input_dir)
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=default_collate)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=default_collate)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=default_collate)
+    if len(dataset.classes) != expected_classes:
+        raise ValueError(f"Expected {expected_classes} classes, found {len(dataset.classes)}")
 
-    return train_loader, val_loader, test_loader
+    class_counts = {cls: 0 for cls in dataset.classes}
+
+    for class_name in dataset.classes:
+        os.makedirs(os.path.join(output_dir, class_name), exist_ok=True)
+
+    for img_path, label in tqdm.tqdm(dataset.samples, desc=f"Processing {os.path.basename(input_dir)}"):
+        try:
+            img = Image.open(img_path).convert('RGB')
+            tensor = transform(img)
+
+            class_name = dataset.classes[label]
+            class_counts[class_name] += 1
+
+            filename = os.path.basename(img_path).split('.')[0] + '.pt'
+            save_path = os.path.join(output_dir, class_name, filename)
+
+            torch.save(tensor, save_path)
+        except Exception as e:
+            verbose_logger.error(f"Error processing {img_path}: {e}")
+
+    verbose_logger.info("Class distribution:")
+    for cls, count in class_counts.items():
+        verbose_logger.info(f"{cls}: {count} images")
+
+
+def get_data_loaders(train_dir, val_dir, batch_size=16):
+    # Modified to load pre-transformed tensors
+    class TensorDataset(Dataset):
+        def __init__(self, root_dir):
+            self.samples = []
+            self.classes = sorted(os.listdir(root_dir))
+            self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
+
+            for class_name in self.classes:
+                class_dir = os.path.join(root_dir, class_name)
+                for file in os.listdir(class_dir):
+                    if file.endswith('.pt'):
+                        self.samples.append((
+                            os.path.join(class_dir, file),
+                            self.class_to_idx[class_name]
+                        ))
+
+        def __len__(self):
+            return len(self.samples)
+
+        def __getitem__(self, idx):
+            path, label = self.samples[idx]
+            tensor = torch.load(path)
+            return tensor, label
+
+    train_dataset = TensorDataset(train_dir)
+    val_dataset = TensorDataset(val_dir)
+
+    return (
+        DataLoader(train_dataset, batch_size=batch_size, shuffle=True),
+        DataLoader(val_dataset, batch_size=batch_size),
+    )
 
 class Classifier(nn.Module):
     def __init__(self, num_classes):
         super(Classifier, self).__init__()
         self.backbone = models.resnet50(weights="IMAGENET1K_V2")
+
+        self.backbone.layer1.add_module('dropout', nn.Dropout(0.2))
+        self.backbone.layer2.add_module('dropout', nn.Dropout(0.2))
+        self.backbone.layer3.add_module('dropout', nn.Dropout(0.2))
+        self.backbone.layer4.add_module('dropout', nn.Dropout(0.2))
+
         for param in self.backbone.parameters():
             param.requires_grad = False
 
-        # verbose_logger.debug(f"Initializing classifier with {num_classes} classes")
+        verbose_logger.debug(f"Initializing classifier with {num_classes} classes")
         self.backbone.fc = nn.Linear(self.backbone.fc.in_features, num_classes)
 
     def forward(self, x):
@@ -91,7 +151,7 @@ class Classifier(nn.Module):
 
 def train_model(model, train_loader, val_loader, num_epochs, device, save_path: str):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=0.0005)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', patience=5, verbose=True)
 
     model.to(device)
@@ -177,32 +237,46 @@ def train_model(model, train_loader, val_loader, num_epochs, device, save_path: 
             verbose_logger.info(f"Model saved with val_loss: {val_loss:.4f}")
             verbose_logger.info(f"Model path: {save_path}")
 
+
 def main():
     global verbose_logger, progress_logger
     verbose_logger, progress_logger = setup_logging()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-    verbose_logger.info(f"Num GPUs Available: {torch.cuda.device_count()}")
+    # Define directories
+    base_dir = 'datasets2'
+    img_dirs = {
+        'train': os.path.join(base_dir, 'images/train'),
+        'val': os.path.join(base_dir, 'images/val'),
+    }
+    tensor_dirs = {
+        'train': os.path.join(base_dir, 'tensors2/train'),
+        'val': os.path.join(base_dir, 'tensors2/val'),
+    }
 
-    train_dir = 'train'
-    val_dir = 'val'
-    test_dir = 'test'
+    # Transform and save images as tensors
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
 
-    batch_size = 384
+    for split, img_dir in img_dirs.items():
+        verbose_logger.info(f'Processing {split} dataset')
+        transform_and_save_dataset(img_dir, tensor_dirs[split], transform)
+
+    # Rest of your training code remains the same
+    batch_size = 128
     num_epochs = 50
-    num_classes = 8
-    save_path = 'resnet_codebrim.pth'
-
-    verbose_logger.info("=== Training Configuration ===")
-    verbose_logger.info(f"Batch size: {batch_size}")
-    verbose_logger.info(f"Number of epochs: {num_epochs}")
-    verbose_logger.info(f"Number of classes: {num_classes}")
-    verbose_logger.info(f"Save path: {save_path}")
-
+    num_classes = 5
+    save_path = 'output/resnet_torch_training_5_classes.pth'
     device = get_device()
-    train_loader, val_loader, test_loader = get_data_loaders(train_dir, val_dir, test_dir, batch_size)
-    model = Classifier(num_classes)
 
+    train_loader, val_loader, = get_data_loaders(
+        tensor_dirs['train'], tensor_dirs['val'],
+        batch_size
+    )
+
+    model = Classifier(num_classes)
     model_summary = summary(model, input_size=(batch_size, 3, 224, 224))
     verbose_logger.info(f"Model Summary:\n{model_summary}")
 

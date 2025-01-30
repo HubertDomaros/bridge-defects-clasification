@@ -23,6 +23,6 @@ def copy_images_by_classes(source_dir, out_dir,
                      os.path.abspath(os.path.join(out_dir, str(class_id), img)))
     
 #%%
-copy_images_by_classes('datasets/images/val', 'datasets/images/val',
+copy_images_by_classes('../datasets/images/val', 'datasets/images/val',
                        'datasets/labels/val.json',
                        'img', 'combination_id')
