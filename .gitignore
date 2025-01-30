@@ -1,5 +1,11 @@
 datasets
 .idea
+.vs
+output
+smietnik
+datasets2
+smietnik
+smietnik
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
